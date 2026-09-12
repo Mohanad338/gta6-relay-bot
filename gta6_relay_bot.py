@@ -11,6 +11,7 @@ import json
 import time
 import requests
 from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
 
 # ==================== الإعدادات (تُقرأ من متغيرات البيئة / GitHub Secrets) ====================
 TG_API_ID = int(os.environ["TG_API_ID"])
@@ -139,7 +140,7 @@ def main():
     state = load_state()
     last_id = state.get("last_message_id", 0)
 
-    with TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH) as client:
+    with TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH) as client:
         if last_id == 0:
             # أول تشغيل: انشر آخر 5 منشورات (من الأقدم إلى الأحدث)
             messages = list(client.iter_messages(SOURCE_CHANNEL, limit=INITIAL_POST_COUNT))
