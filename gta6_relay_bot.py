@@ -74,32 +74,43 @@ def rewrite_to_arabic(text: str) -> str:
 
 
 # ==================== النشر عبر Telegram Bot API ====================
+def _check_response(resp):
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data
+
+
 def send_text(caption: str):
-    requests.post(
+    resp = requests.post(
         f"{BOT_API_URL}/sendMessage",
         data={"chat_id": TARGET_CHAT, "text": caption, "parse_mode": "HTML"},
         timeout=30,
     )
+    _check_response(resp)
 
 
 def send_photo(file_path: str, caption: str):
     with open(file_path, "rb") as f:
-        requests.post(
+        resp = requests.post(
             f"{BOT_API_URL}/sendPhoto",
             data={"chat_id": TARGET_CHAT, "caption": caption, "parse_mode": "HTML"},
             files={"photo": f},
             timeout=60,
         )
+    _check_response(resp)
 
 
 def send_video(file_path: str, caption: str):
     with open(file_path, "rb") as f:
-        requests.post(
+        resp = requests.post(
             f"{BOT_API_URL}/sendVideo",
             data={"chat_id": TARGET_CHAT, "caption": caption, "parse_mode": "HTML"},
             files={"video": f},
             timeout=120,
         )
+    _check_response(resp)
 
 
 # ==================== معالجة رسالة واحدة ====================
