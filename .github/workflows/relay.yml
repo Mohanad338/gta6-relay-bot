@@ -2,15 +2,20 @@ name: GTA6AR Relay Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # كل 5 دقائق
-  workflow_dispatch: {}       # يسمح بتشغيله يدويًا من تبويب Actions
+    - cron: "0 */5 * * *"   # كل 5 ساعات (كل تشغيل يبقى شغال ~5:40 ساعة كاستماع مباشر)
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
+concurrency:
+  group: relay-${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   relay:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,6 +38,7 @@ jobs:
         run: python gta6_relay_bot.py
 
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
