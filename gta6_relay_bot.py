@@ -3,7 +3,8 @@
 - يستمع للرسائل الجديدة لحظة نزولها (events.NewMessage) بدل الفحص الدوري
 - أول تشغيل: يبدأ من آخر 5 منشورات فقط بقناة المصدر
 - كل منشور لازم يترجم للعربي قبل النشر - لو فشلت الترجمة، ينتظر ويعاد المحاولة، وما ينشر نص بدون ترجمة أبداً
-- يضيف رابط القناة (بدون 📌) بنهاية كل منشور
+- يزيل أي ذكر للقناة المصدر أو ترويج تبعها، ويضيف رابط قناتك بنهاية كل منشور
+- إذا كان منشور المصدر يحتوي أكثر من صورة/فيديو (ألبوم)، يُنشر كمنشور واحد بكل الوسائط مع نص واحد
 """
 
 import os
@@ -32,8 +33,10 @@ BOT_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MAX_RUNTIME_SECONDS = 5 * 3600 + 40 * 60  # 5 ساعات و40 دقيقة
 GEMINI_MAX_RETRIES = 3
 GEMINI_RETRY_DELAY = 8
+ALBUM_WAIT_SECONDS = 2.5  # مدة الانتظار لتجميع كل صور/فيديوهات المنشور الواحد قبل النشر
 
 client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+pending_albums: dict = {}
 
 
 # ==================== إدارة الحالة ====================
@@ -55,10 +58,14 @@ def rewrite_to_arabic(text: str) -> str:
         return ""
 
     prompt = (
-        "أعد صياغة الخبر التالي وترجمه إلى اللغة العربية بأسلوب صحفي طبيعي، "
-        "وكأن عربي كتبه من الأساس وليس ترجمة حرفية. "
-        "لا تضف مقدمات مثل 'إليك الترجمة' ولا أي تعليق إضافي، فقط النص المُعاد صياغته:\n\n"
-        f"{text}"
+        "أنت محرر أخبار عربي. أعد كتابة الخبر التالي بالعربية من جديد، وكأن محرر عربي كتبه من الصفر "
+        "وليس ترجمة - أسلوب صحفي طبيعي وسلس.\n\n"
+        "قواعد صارمة:\n"
+        "- احذف نهائيًا أي ذكر لاسم القناة المصدر، شعارها، رابطها، أو أي دعوة للانضمام لها أو لمجموعة/چات خاص فيها.\n"
+        "- احذف أي عبارات ترويجية أو تفاعلية لا علاقة لها بالخبر نفسه (مثل طلب لايك/مشاركة/تعليق، أو إعلانات مسابقات).\n"
+        "- احذف أي هاشتاغات أو إيموجيات ترويجية لا تخدم مضمون الخبر.\n"
+        "- لا تضف أي مقدمة مثل 'إليك الترجمة' ولا أي تعليق إضافي، فقط نص الخبر النهائي بالعربي.\n\n"
+        f"النص الأصلي:\n{text}"
     )
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -81,7 +88,6 @@ def rewrite_to_arabic(text: str) -> str:
             print(f"[Gemini error] محاولة {attempt}/{GEMINI_MAX_RETRIES}: {e}")
             time.sleep(GEMINI_RETRY_DELAY)
 
-    # فشلت كل المحاولات: لا ننشر النص الأصلي أبداً، نرفع استثناء ليعاد المحاولة لاحقاً
     raise RuntimeError(f"تعذرت الترجمة عبر Gemini بعد {GEMINI_MAX_RETRIES} محاولات: {last_error}")
 
 
@@ -130,49 +136,130 @@ def send_video(file_path: str, caption: str):
     _check_response(resp)
 
 
-# ==================== معالجة رسالة واحدة ====================
-async def process_message(message):
-    text = message.message or ""
-    rewritten = rewrite_to_arabic(text)  # يرفع استثناء لو فشلت الترجمة كليًا
-
-    if rewritten:
-        caption = f"{rewritten}\n\n{CHANNEL_LINK}"
-    else:
-        caption = CHANNEL_LINK
-
-    if message.photo:
-        path = await client.download_media(message, file="temp_media")
-        try:
-            send_photo(path, caption)
-        finally:
-            if path and os.path.exists(path):
-                os.remove(path)
-    elif message.video:
-        path = await client.download_media(message, file="temp_media")
-        try:
-            send_video(path, caption)
-        finally:
-            if path and os.path.exists(path):
-                os.remove(path)
-    else:
-        if not text.strip():
-            return
-        send_text(caption)
-
-    print(f"[OK] تم نشر الرسالة {message.id}")
-
-
-async def handle_message(msg, state: dict):
+def send_media_group(media_paths_types, caption: str):
+    """ينشر أكثر من صورة/فيديو كمنشور واحد (ألبوم) مع نص واحد على أول عنصر."""
+    media = []
+    files = {}
     try:
-        await process_message(msg)
-        if msg.id > state["last_message_id"]:
-            state["last_message_id"] = msg.id
+        for idx, (path, mtype) in enumerate(media_paths_types):
+            key = f"file{idx}"
+            item = {"type": mtype, "media": f"attach://{key}"}
+            if idx == 0:
+                item["caption"] = caption
+                item["parse_mode"] = "HTML"
+            media.append(item)
+            files[key] = open(path, "rb")
+
+        resp = requests.post(
+            f"{BOT_API_URL}/sendMediaGroup",
+            data={"chat_id": TARGET_CHAT, "media": json.dumps(media)},
+            files=files,
+            timeout=120,
+        )
+        _check_response(resp)
+    finally:
+        for f in files.values():
+            f.close()
+
+
+# ==================== معالجة مجموعة رسائل (منشور واحد قد يحتوي أكثر من وسائط) ====================
+async def process_group(messages):
+    text = ""
+    for m in messages:
+        if m.message and m.message.strip():
+            text = m.message
+            break
+
+    rewritten = rewrite_to_arabic(text)
+    caption = f"{rewritten}\n\n{CHANNEL_LINK}" if rewritten else CHANNEL_LINK
+
+    media_items = []
+    try:
+        for m in messages:
+            if m.photo:
+                path = await client.download_media(m, file="temp_media")
+                if path:
+                    media_items.append((path, "photo"))
+            elif m.video:
+                path = await client.download_media(m, file="temp_media")
+                if path:
+                    media_items.append((path, "video"))
+
+        if len(media_items) >= 2:
+            send_media_group(media_items, caption)
+        elif len(media_items) == 1:
+            path, mtype = media_items[0]
+            if mtype == "photo":
+                send_photo(path, caption)
+            else:
+                send_video(path, caption)
+        else:
+            if not text.strip():
+                return
+            send_text(caption)
+    finally:
+        for path, _ in media_items:
+            if path and os.path.exists(path):
+                os.remove(path)
+
+    ids = ", ".join(str(m.id) for m in messages)
+    print(f"[OK] تم نشر المنشور (الرسائل: {ids})")
+
+
+async def handle_group(messages, state: dict):
+    try:
+        await process_group(messages)
+        max_id = max(m.id for m in messages)
+        if max_id > state["last_message_id"]:
+            state["last_message_id"] = max_id
             save_state(state["last_message_id"])
     except Exception as e:
-        print(f"[ERROR] فشل نشر الرسالة {msg.id}: {e} -- سيُعاد المحاولة بالتشغيلة/الدورة الجاية")
+        ids = ", ".join(str(m.id) for m in messages)
+        print(f"[ERROR] فشل نشر المنشور (الرسائل: {ids}): {e} -- سيُعاد المحاولة بالتشغيلة/الدورة الجاية")
 
 
-# ==================== تعويض ما فات أثناء الانقطاع القصير بين التشغيلات ====================
+# ==================== تجميع الألبومات أثناء الاستماع المباشر ====================
+async def flush_album(grouped_id, state: dict):
+    await asyncio.sleep(ALBUM_WAIT_SECONDS)
+    entry = pending_albums.pop(grouped_id, None)
+    if not entry:
+        return
+    messages = sorted(entry["messages"], key=lambda m: m.id)
+    await handle_group(messages, state)
+
+
+async def on_new_message(event, state: dict):
+    msg = event.message
+    if msg.grouped_id:
+        gid = msg.grouped_id
+        if gid not in pending_albums:
+            pending_albums[gid] = {
+                "messages": [msg],
+                "timer": asyncio.create_task(flush_album(gid, state)),
+            }
+        else:
+            pending_albums[gid]["messages"].append(msg)
+    else:
+        await handle_group([msg], state)
+
+
+# ==================== تجميع الألبومات عند تعويض ما فات (catch_up) ====================
+def group_messages(messages):
+    groups = []
+    seen = {}
+    for m in messages:
+        if m.grouped_id:
+            if m.grouped_id in seen:
+                seen[m.grouped_id].append(m)
+            else:
+                lst = [m]
+                seen[m.grouped_id] = lst
+                groups.append(lst)
+        else:
+            groups.append([m])
+    return groups
+
+
 async def catch_up(state: dict):
     last_id = state["last_message_id"]
 
@@ -182,12 +269,13 @@ async def catch_up(state: dict):
             last_id = max(latest[0].id - 5, 0)
             state["last_message_id"] = last_id
             save_state(last_id)
-        messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=10)
+        messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=15)
     else:
         messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=50)
 
-    for msg in reversed(list(messages)):
-        await handle_message(msg, state)
+    ordered = list(reversed(list(messages)))
+    for group in group_messages(ordered):
+        await handle_group(group, state)
 
 
 # ==================== التشغيل الرئيسي ====================
@@ -197,7 +285,7 @@ async def main():
 
     @client.on(events.NewMessage(chats=SOURCE_CHANNEL))
     async def live_handler(event):
-        await handle_message(event.message, state)
+        await on_new_message(event, state)
 
     await catch_up(state)
     print("[LISTENING] البوت الآن يستمع مباشرة لأي منشور جديد...")
